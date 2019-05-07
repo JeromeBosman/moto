@@ -27,6 +27,22 @@ def test_create_layer_response():
 
     response.should.contain("LayerId")
 
+    second_stack_id = client.create_stack(
+        Name="test_stack_2",
+        Region="us-east-1",
+        ServiceRoleArn="service_arn",
+        DefaultInstanceProfileArn="profile_arn"
+    )['StackId']
+
+    response = client.create_layer(
+        StackId=second_stack_id,
+        Type="custom",
+        Name="TestLayer",
+        Shortname="TestLayerShortName"
+    )
+
+    response.should.contain("LayerId")
+
     # ClientError
     client.create_layer.when.called_with(
         StackId=stack_id,
@@ -45,6 +61,15 @@ def test_create_layer_response():
     ).should.throw(
         Exception, re.compile(
             r'already a layer with shortname "TestLayerShortName"')
+    )
+    # ClientError
+    client.create_layer.when.called_with(
+        StackId="nothere",
+        Type="custom",
+        Name="TestLayer",
+        Shortname="_"
+    ).should.throw(
+        Exception, "nothere"
     )
 
 
@@ -70,3 +95,23 @@ def test_describe_layers():
     rv1['Layers'].should.equal(rv2['Layers'])
 
     rv1['Layers'][0]['Name'].should.equal("TestLayer")
+
+    # ClientError
+    client.describe_layers.when.called_with(
+        StackId=stack_id,
+        LayerIds=[layer_id]
+    ).should.throw(
+        Exception, "Please provide one or more layer IDs or a stack ID"
+    )
+    # ClientError
+    client.describe_layers.when.called_with(
+        StackId="nothere"
+    ).should.throw(
+        Exception, "Unable to find stack with ID nothere"
+    )
+    # ClientError
+    client.describe_layers.when.called_with(
+        LayerIds=["nothere"]
+    ).should.throw(
+        Exception, "nothere"
+    )

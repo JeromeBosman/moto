@@ -13,30 +13,72 @@ from moto.sns.models import DEFAULT_TOPIC_POLICY, DEFAULT_EFFECTIVE_DELIVERY_POL
 @mock_sns
 def test_create_and_delete_topic():
     conn = boto3.client("sns", region_name="us-east-1")
-    conn.create_topic(Name="some-topic")
+    for topic_name in ('some-topic', '-some-topic-', '_some-topic_', 'a' * 256):
+        conn.create_topic(Name=topic_name)
 
-    topics_json = conn.list_topics()
-    topics = topics_json["Topics"]
-    topics.should.have.length_of(1)
-    topics[0]['TopicArn'].should.equal(
-        "arn:aws:sns:{0}:123456789012:some-topic"
-        .format(conn._client_config.region_name)
+        topics_json = conn.list_topics()
+        topics = topics_json["Topics"]
+        topics.should.have.length_of(1)
+        topics[0]['TopicArn'].should.equal(
+            "arn:aws:sns:{0}:123456789012:{1}"
+            .format(conn._client_config.region_name, topic_name)
+        )
+
+        # Delete the topic
+        conn.delete_topic(TopicArn=topics[0]['TopicArn'])
+
+        # And there should now be 0 topics
+        topics_json = conn.list_topics()
+        topics = topics_json["Topics"]
+        topics.should.have.length_of(0)
+
+@mock_sns
+def test_create_topic_should_be_indempodent():
+    conn = boto3.client("sns", region_name="us-east-1")
+    topic_arn = conn.create_topic(Name="some-topic")['TopicArn']
+    conn.set_topic_attributes(
+        TopicArn=topic_arn,
+        AttributeName="DisplayName",
+        AttributeValue="should_be_set"
     )
+    topic_display_name = conn.get_topic_attributes(
+        TopicArn=topic_arn
+    )['Attributes']['DisplayName']
+    topic_display_name.should.be.equal("should_be_set")
 
-    # Delete the topic
-    conn.delete_topic(TopicArn=topics[0]['TopicArn'])
-
-    # And there should now be 0 topics
-    topics_json = conn.list_topics()
-    topics = topics_json["Topics"]
-    topics.should.have.length_of(0)
-
+    #recreate topic to prove indempodentcy
+    topic_arn = conn.create_topic(Name="some-topic")['TopicArn']
+    topic_display_name = conn.get_topic_attributes(
+        TopicArn=topic_arn
+    )['Attributes']['DisplayName']
+    topic_display_name.should.be.equal("should_be_set")
 
 @mock_sns
 def test_get_missing_topic():
     conn = boto3.client("sns", region_name="us-east-1")
     conn.get_topic_attributes.when.called_with(
         TopicArn="a-fake-arn").should.throw(ClientError)
+
+@mock_sns
+def test_create_topic_must_meet_constraints():
+    conn = boto3.client("sns", region_name="us-east-1")
+    common_random_chars = [':', ";", "!", "@", "|", "^", "%"]
+    for char in common_random_chars:
+        conn.create_topic.when.called_with(
+            Name="no%s_invalidchar" % char).should.throw(ClientError)
+    conn.create_topic.when.called_with(
+            Name="no spaces allowed").should.throw(ClientError)
+
+
+@mock_sns
+def test_create_topic_should_be_of_certain_length():
+    conn = boto3.client("sns", region_name="us-east-1")
+    too_short = ""
+    conn.create_topic.when.called_with(
+            Name=too_short).should.throw(ClientError)
+    too_long = "x" * 257
+    conn.create_topic.when.called_with(
+            Name=too_long).should.throw(ClientError)
 
 
 @mock_sns
@@ -129,3 +171,20 @@ def test_topic_paging():
     response.shouldnt.have("NextToken")
 
     topics_list.should.have.length_of(int(DEFAULT_PAGE_SIZE / 2))
+
+
+@mock_sns
+def test_add_remove_permissions():
+    conn = boto3.client('sns', region_name='us-east-1')
+    response = conn.create_topic(Name='testpermissions')
+
+    conn.add_permission(
+        TopicArn=response['TopicArn'],
+        Label='Test1234',
+        AWSAccountId=['999999999999'],
+        ActionName=['AddPermission']
+    )
+    conn.remove_permission(
+        TopicArn=response['TopicArn'],
+        Label='Test1234'
+    )

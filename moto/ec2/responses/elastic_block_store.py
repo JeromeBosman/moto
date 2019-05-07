@@ -6,9 +6,9 @@ from moto.ec2.utils import filters_from_querystring
 class ElasticBlockStore(BaseResponse):
 
     def attach_volume(self):
-        volume_id = self.querystring.get('VolumeId')[0]
-        instance_id = self.querystring.get('InstanceId')[0]
-        device_path = self.querystring.get('Device')[0]
+        volume_id = self._get_param('VolumeId')
+        instance_id = self._get_param('InstanceId')
+        device_path = self._get_param('Device')
         if self.is_not_dryrun('AttachVolume'):
             attachment = self.ec2_backend.attach_volume(
                 volume_id, instance_id, device_path)
@@ -16,64 +16,63 @@ class ElasticBlockStore(BaseResponse):
             return template.render(attachment=attachment)
 
     def copy_snapshot(self):
+        source_snapshot_id = self._get_param('SourceSnapshotId')
+        source_region = self._get_param('SourceRegion')
+        description = self._get_param('Description')
         if self.is_not_dryrun('CopySnapshot'):
-            raise NotImplementedError(
-                'ElasticBlockStore.copy_snapshot is not yet implemented')
+            snapshot = self.ec2_backend.copy_snapshot(
+                source_snapshot_id, source_region, description)
+            template = self.response_template(COPY_SNAPSHOT_RESPONSE)
+            return template.render(snapshot=snapshot)
 
     def create_snapshot(self):
-        description = self.querystring.get('Description', [None])[0]
-        volume_id = self.querystring.get('VolumeId')[0]
+        volume_id = self._get_param('VolumeId')
+        description = self._get_param('Description')
+        tags = self._parse_tag_specification("TagSpecification")
+        snapshot_tags = tags.get('snapshot', {})
         if self.is_not_dryrun('CreateSnapshot'):
             snapshot = self.ec2_backend.create_snapshot(volume_id, description)
+            snapshot.add_tags(snapshot_tags)
             template = self.response_template(CREATE_SNAPSHOT_RESPONSE)
             return template.render(snapshot=snapshot)
 
     def create_volume(self):
-        size = self.querystring.get('Size', [None])[0]
-        zone = self.querystring.get('AvailabilityZone', [None])[0]
-        snapshot_id = self.querystring.get('SnapshotId', [None])[0]
-        encrypted = self.querystring.get('Encrypted', ['false'])[0]
+        size = self._get_param('Size')
+        zone = self._get_param('AvailabilityZone')
+        snapshot_id = self._get_param('SnapshotId')
+        tags = self._parse_tag_specification("TagSpecification")
+        volume_tags = tags.get('volume', {})
+        encrypted = self._get_param('Encrypted', if_none=False)
         if self.is_not_dryrun('CreateVolume'):
             volume = self.ec2_backend.create_volume(
                 size, zone, snapshot_id, encrypted)
+            volume.add_tags(volume_tags)
             template = self.response_template(CREATE_VOLUME_RESPONSE)
             return template.render(volume=volume)
 
     def delete_snapshot(self):
-        snapshot_id = self.querystring.get('SnapshotId')[0]
+        snapshot_id = self._get_param('SnapshotId')
         if self.is_not_dryrun('DeleteSnapshot'):
             self.ec2_backend.delete_snapshot(snapshot_id)
             return DELETE_SNAPSHOT_RESPONSE
 
     def delete_volume(self):
-        volume_id = self.querystring.get('VolumeId')[0]
+        volume_id = self._get_param('VolumeId')
         if self.is_not_dryrun('DeleteVolume'):
             self.ec2_backend.delete_volume(volume_id)
             return DELETE_VOLUME_RESPONSE
 
     def describe_snapshots(self):
         filters = filters_from_querystring(self.querystring)
-        # querystring for multiple snapshotids results in SnapshotId.1,
-        # SnapshotId.2 etc
-        snapshot_ids = ','.join(
-            [','.join(s[1]) for s in self.querystring.items() if 'SnapshotId' in s[0]])
-        snapshots = self.ec2_backend.describe_snapshots(filters=filters)
-        # Describe snapshots to handle filter on snapshot_ids
-        snapshots = [
-            s for s in snapshots if s.id in snapshot_ids] if snapshot_ids else snapshots
+        snapshot_ids = self._get_multi_param('SnapshotId')
+        snapshots = self.ec2_backend.describe_snapshots(snapshot_ids=snapshot_ids, filters=filters)
         template = self.response_template(DESCRIBE_SNAPSHOTS_RESPONSE)
         return template.render(snapshots=snapshots)
 
     def describe_volumes(self):
         filters = filters_from_querystring(self.querystring)
-        # querystring for multiple volumeids results in VolumeId.1, VolumeId.2
-        # etc
-        volume_ids = ','.join(
-            [','.join(v[1]) for v in self.querystring.items() if 'VolumeId' in v[0]])
-        volumes = self.ec2_backend.describe_volumes(filters=filters)
-        # Describe volumes to handle filter on volume_ids
-        volumes = [
-            v for v in volumes if v.id in volume_ids] if volume_ids else volumes
+        volume_ids = self._get_multi_param('VolumeId')
+        volumes = self.ec2_backend.describe_volumes(volume_ids=volume_ids, filters=filters)
         template = self.response_template(DESCRIBE_VOLUMES_RESPONSE)
         return template.render(volumes=volumes)
 
@@ -86,9 +85,9 @@ class ElasticBlockStore(BaseResponse):
             'ElasticBlockStore.describe_volume_status is not yet implemented')
 
     def detach_volume(self):
-        volume_id = self.querystring.get('VolumeId')[0]
-        instance_id = self.querystring.get('InstanceId')[0]
-        device_path = self.querystring.get('Device')[0]
+        volume_id = self._get_param('VolumeId')
+        instance_id = self._get_param('InstanceId')
+        device_path = self._get_param('Device')
         if self.is_not_dryrun('DetachVolume'):
             attachment = self.ec2_backend.detach_volume(
                 volume_id, instance_id, device_path)
@@ -106,7 +105,7 @@ class ElasticBlockStore(BaseResponse):
                 'ElasticBlockStore.import_volume is not yet implemented')
 
     def describe_snapshot_attribute(self):
-        snapshot_id = self.querystring.get('SnapshotId')[0]
+        snapshot_id = self._get_param('SnapshotId')
         groups = self.ec2_backend.get_create_volume_permission_groups(
             snapshot_id)
         template = self.response_template(
@@ -114,10 +113,10 @@ class ElasticBlockStore(BaseResponse):
         return template.render(snapshot_id=snapshot_id, groups=groups)
 
     def modify_snapshot_attribute(self):
-        snapshot_id = self.querystring.get('SnapshotId')[0]
-        operation_type = self.querystring.get('OperationType')[0]
-        group = self.querystring.get('UserGroup.1', [None])[0]
-        user_id = self.querystring.get('UserId.1', [None])[0]
+        snapshot_id = self._get_param('SnapshotId')
+        operation_type = self._get_param('OperationType')
+        group = self._get_param('UserGroup.1')
+        user_id = self._get_param('UserId.1')
         if self.is_not_dryrun('ModifySnapshotAttribute'):
             if (operation_type == 'add'):
                 self.ec2_backend.add_create_volume_permission(
@@ -151,6 +150,18 @@ CREATE_VOLUME_RESPONSE = """<CreateVolumeResponse xmlns="http://ec2.amazonaws.co
   <availabilityZone>{{ volume.zone.name }}</availabilityZone>
   <status>creating</status>
   <createTime>{{ volume.create_time}}</createTime>
+  {% if volume.get_tags() %}
+    <tagSet>
+      {% for tag in volume.get_tags() %}
+          <item>
+          <resourceId>{{ tag.resource_id }}</resourceId>
+          <resourceType>{{ tag.resource_type }}</resourceType>
+          <key>{{ tag.key }}</key>
+          <value>{{ tag.value }}</value>
+          </item>
+      {% endfor %}
+    </tagSet>
+  {% endif %}
   <volumeType>standard</volumeType>
 </CreateVolumeResponse>"""
 
@@ -182,16 +193,18 @@ DESCRIBE_VOLUMES_RESPONSE = """<DescribeVolumesResponse xmlns="http://ec2.amazon
                     </item>
                 {% endif %}
              </attachmentSet>
-             <tagSet>
-               {% for tag in volume.get_tags() %}
-                 <item>
-                   <resourceId>{{ tag.resource_id }}</resourceId>
-                   <resourceType>{{ tag.resource_type }}</resourceType>
-                   <key>{{ tag.key }}</key>
-                   <value>{{ tag.value }}</value>
-                 </item>
-               {% endfor %}
-             </tagSet>
+             {% if volume.get_tags() %}
+               <tagSet>
+                 {% for tag in volume.get_tags() %}
+                   <item>
+                     <resourceId>{{ tag.resource_id }}</resourceId>
+                     <resourceType>{{ tag.resource_type }}</resourceType>
+                     <key>{{ tag.key }}</key>
+                     <value>{{ tag.value }}</value>
+                   </item>
+                 {% endfor %}
+               </tagSet>
+             {% endif %}
              <volumeType>standard</volumeType>
           </item>
       {% endfor %}
@@ -228,11 +241,26 @@ CREATE_SNAPSHOT_RESPONSE = """<CreateSnapshotResponse xmlns="http://ec2.amazonaw
   <status>pending</status>
   <startTime>{{ snapshot.start_time}}</startTime>
   <progress>60%</progress>
-  <ownerId>123456789012</ownerId>
+  <ownerId>{{ snapshot.owner_id }}</ownerId>
   <volumeSize>{{ snapshot.volume.size }}</volumeSize>
   <description>{{ snapshot.description }}</description>
   <encrypted>{{ snapshot.encrypted }}</encrypted>
+  <tagSet>
+    {% for tag in snapshot.get_tags() %}
+      <item>
+      <resourceId>{{ tag.resource_id }}</resourceId>
+      <resourceType>{{ tag.resource_type }}</resourceType>
+      <key>{{ tag.key }}</key>
+      <value>{{ tag.value }}</value>
+      </item>
+    {% endfor %}
+  </tagSet>
 </CreateSnapshotResponse>"""
+
+COPY_SNAPSHOT_RESPONSE = """<CopySnapshotResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <requestId>59dbff89-35bd-4eac-99ed-be587EXAMPLE</requestId>
+  <snapshotId>{{ snapshot.id }}</snapshotId>
+</CopySnapshotResponse>"""
 
 DESCRIBE_SNAPSHOTS_RESPONSE = """<DescribeSnapshotsResponse xmlns="http://ec2.amazonaws.com/doc/2013-10-15/">
    <requestId>59dbff89-35bd-4eac-99ed-be587EXAMPLE</requestId>
@@ -244,7 +272,7 @@ DESCRIBE_SNAPSHOTS_RESPONSE = """<DescribeSnapshotsResponse xmlns="http://ec2.am
              <status>{{ snapshot.status }}</status>
              <startTime>{{ snapshot.start_time}}</startTime>
              <progress>100%</progress>
-             <ownerId>123456789012</ownerId>
+             <ownerId>{{ snapshot.owner_id }}</ownerId>
             <volumeSize>{{ snapshot.volume.size }}</volumeSize>
              <description>{{ snapshot.description }}</description>
              <encrypted>{{ snapshot.encrypted }}</encrypted>

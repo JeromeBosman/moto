@@ -1,4 +1,7 @@
 from __future__ import unicode_literals
+
+from datetime import datetime
+
 import boto
 import boto3
 import sure  # noqa
@@ -23,6 +26,25 @@ def test_get_group():
     conn.get_group('my-group')
     with assert_raises(BotoServerError):
         conn.get_group('not-group')
+
+
+@mock_iam()
+def test_get_group_current():
+    conn = boto3.client('iam', region_name='us-east-1')
+    conn.create_group(GroupName='my-group')
+    result = conn.get_group(GroupName='my-group')
+
+    assert result['Group']['Path'] == '/'
+    assert result['Group']['GroupName'] == 'my-group'
+    assert isinstance(result['Group']['CreateDate'], datetime)
+    assert result['Group']['GroupId']
+    assert result['Group']['Arn'] == 'arn:aws:iam::123456789012:group/my-group'
+    assert not result['Users']
+
+    # Make a group with a different path:
+    other_group = conn.create_group(GroupName='my-other-group', Path='some/location')
+    assert other_group['Group']['Path'] == 'some/location'
+    assert other_group['Group']['Arn'] == 'arn:aws:iam::123456789012:group/some/location/my-other-group'
 
 
 @mock_iam_deprecated()
@@ -82,6 +104,26 @@ def test_put_group_policy():
     conn.put_group_policy('my-group', 'my-policy', '{"some": "json"}')
 
 
+@mock_iam
+def test_attach_group_policies():
+    conn = boto3.client('iam', region_name='us-east-1')
+    conn.create_group(GroupName='my-group')
+    conn.list_attached_group_policies(GroupName='my-group')['AttachedPolicies'].should.be.empty
+    policy_arn = 'arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role'
+    conn.list_attached_group_policies(GroupName='my-group')['AttachedPolicies'].should.be.empty
+    conn.attach_group_policy(GroupName='my-group', PolicyArn=policy_arn)
+    conn.list_attached_group_policies(GroupName='my-group')['AttachedPolicies'].should.equal(
+        [
+            {
+                'PolicyName': 'AmazonElasticMapReduceforEC2Role',
+                'PolicyArn': policy_arn,
+            }
+        ])
+
+    conn.detach_group_policy(GroupName='my-group', PolicyArn=policy_arn)
+    conn.list_attached_group_policies(GroupName='my-group')['AttachedPolicies'].should.be.empty
+
+
 @mock_iam_deprecated()
 def test_get_group_policy():
     conn = boto.connect_iam()
@@ -90,7 +132,8 @@ def test_get_group_policy():
         conn.get_group_policy('my-group', 'my-policy')
 
     conn.put_group_policy('my-group', 'my-policy', '{"some": "json"}')
-    policy = conn.get_group_policy('my-group', 'my-policy')
+    conn.get_group_policy('my-group', 'my-policy')
+
 
 @mock_iam_deprecated()
 def test_get_all_group_policies():
@@ -107,6 +150,6 @@ def test_get_all_group_policies():
 def test_list_group_policies():
     conn = boto3.client('iam', region_name='us-east-1')
     conn.create_group(GroupName='my-group')
-    policies = conn.list_group_policies(GroupName='my-group')['PolicyNames'].should.be.empty
+    conn.list_group_policies(GroupName='my-group')['PolicyNames'].should.be.empty
     conn.put_group_policy(GroupName='my-group', PolicyName='my-policy', PolicyDocument='{"some": "json"}')
-    policies = conn.list_group_policies(GroupName='my-group')['PolicyNames'].should.equal(['my-policy'])
+    conn.list_group_policies(GroupName='my-group')['PolicyNames'].should.equal(['my-policy'])

@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import re
+import io
 
 import pytz
 from moto.core.exceptions import DryRunClientError
@@ -17,6 +18,8 @@ from six.moves.urllib.parse import parse_qs, urlparse
 import xmltodict
 from pkg_resources import resource_filename
 from werkzeug.exceptions import HTTPException
+
+import boto3
 from moto.compat import OrderedDict
 from moto.core.utils import camelcase_to_underscores, method_names_from_class
 
@@ -103,7 +106,10 @@ class _TemplateEnvironmentMixin(object):
 class BaseResponse(_TemplateEnvironmentMixin):
 
     default_region = 'us-east-1'
-    region_regex = r'\.(.+?)\.amazonaws\.com'
+    # to extract region, use [^.]
+    region_regex = re.compile(r'\.(?P<region>[a-z]{2}-[a-z]+-\d{1})\.amazonaws\.com')
+    param_list_regex = re.compile(r'(.*)\.(\d+)\.')
+    access_key_regex = re.compile(r'AWS.*(?P<access_key>(?<![A-Z0-9])[A-Z0-9]{20}(?![A-Z0-9]))[:/]')
     aws_service_spec = None
 
     @classmethod
@@ -151,12 +157,12 @@ class BaseResponse(_TemplateEnvironmentMixin):
             querystring.update(headers)
 
         querystring = _decode_dict(querystring)
-
         self.uri = full_url
         self.path = urlparse(full_url).path
         self.querystring = querystring
         self.method = request.method
         self.region = self.get_region_from_url(request, full_url)
+        self.uri_match = None
 
         self.headers = request.headers
         if 'host' not in self.headers:
@@ -164,22 +170,88 @@ class BaseResponse(_TemplateEnvironmentMixin):
         self.response_headers = {"server": "amazon.com"}
 
     def get_region_from_url(self, request, full_url):
-        match = re.search(self.region_regex, full_url)
+        match = self.region_regex.search(full_url)
         if match:
             region = match.group(1)
-        elif 'Authorization' in request.headers:
+        elif 'Authorization' in request.headers and 'AWS4' in request.headers['Authorization']:
             region = request.headers['Authorization'].split(",")[
                 0].split("/")[2]
         else:
             region = self.default_region
         return region
 
+    def get_current_user(self):
+        """
+        Returns the access key id used in this request as the current user id
+        """
+        if 'Authorization' in self.headers:
+            match = self.access_key_regex.search(self.headers['Authorization'])
+            if match:
+                return match.group(1)
+
+        if self.querystring.get('AWSAccessKeyId'):
+            return self.querystring.get('AWSAccessKeyId')
+        else:
+            # Should we raise an unauthorized exception instead?
+            return '111122223333'
+
     def _dispatch(self, request, full_url, headers):
         self.setup_class(request, full_url, headers)
         return self.call_action()
 
-    def call_action(self):
-        headers = self.response_headers
+    def uri_to_regexp(self, uri):
+        """converts uri w/ placeholder to regexp
+          '/cars/{carName}/drivers/{DriverName}'
+        -> '^/cars/.*/drivers/[^/]*$'
+
+          '/cars/{carName}/drivers/{DriverName}/drive'
+        -> '^/cars/.*/drivers/.*/drive$'
+
+        """
+        def _convert(elem, is_last):
+            if not re.match('^{.*}$', elem):
+                return elem
+            name = elem.replace('{', '').replace('}', '')
+            if is_last:
+                return '(?P<%s>[^/]*)' % name
+            return '(?P<%s>.*)' % name
+
+        elems = uri.split('/')
+        num_elems = len(elems)
+        regexp = '^{}$'.format('/'.join([_convert(elem, (i == num_elems - 1)) for i, elem in enumerate(elems)]))
+        return regexp
+
+    def _get_action_from_method_and_request_uri(self, method, request_uri):
+        """basically used for `rest-json` APIs
+        You can refer to example from link below
+        https://github.com/boto/botocore/blob/develop/botocore/data/iot/2015-05-28/service-2.json
+        """
+
+        # service response class should have 'SERVICE_NAME' class member,
+        # if you want to get action from method and url
+        if not hasattr(self, 'SERVICE_NAME'):
+            return None
+        service = self.SERVICE_NAME
+        conn = boto3.client(service, region_name=self.region)
+
+        # make cache if it does not exist yet
+        if not hasattr(self, 'method_urls'):
+            self.method_urls = defaultdict(lambda: defaultdict(str))
+            op_names = conn._service_model.operation_names
+            for op_name in op_names:
+                op_model = conn._service_model.operation_model(op_name)
+                _method = op_model.http['method']
+                uri_regexp = self.uri_to_regexp(op_model.http['requestUri'])
+                self.method_urls[_method][uri_regexp] = op_model.name
+        regexp_and_names = self.method_urls[method]
+        for regexp, name in regexp_and_names.items():
+            match = re.match(regexp, request_uri)
+            self.uri_match = match
+            if match:
+                return name
+        return None
+
+    def _get_action(self):
         action = self.querystring.get('Action', [""])[0]
         if not action:  # Some services use a header for the action
             # Headers are case-insensitive. Probably a better way to do this.
@@ -187,8 +259,14 @@ class BaseResponse(_TemplateEnvironmentMixin):
                 'x-amz-target') or self.headers.get('X-Amz-Target')
             if match:
                 action = match.split(".")[-1]
+        # get action from method and uri
+        if not action:
+            return self._get_action_from_method_and_request_uri(self.method, self.path)
+        return action
 
-        action = camelcase_to_underscores(action)
+    def call_action(self):
+        headers = self.response_headers
+        action = camelcase_to_underscores(self._get_action())
         method_names = method_names_from_class(self.__class__)
         if action in method_names:
             method = getattr(self, action)
@@ -196,16 +274,23 @@ class BaseResponse(_TemplateEnvironmentMixin):
                 response = method()
             except HTTPException as http_error:
                 response = http_error.description, dict(status=http_error.code)
+
             if isinstance(response, six.string_types):
                 return 200, headers, response
             else:
-                body, new_headers = response
+                if len(response) == 2:
+                    body, new_headers = response
+                else:
+                    status, new_headers, body = response
                 status = new_headers.get('status', 200)
                 headers.update(new_headers)
                 # Cast status to string
                 if "status" in headers:
                     headers['status'] = str(headers['status'])
                 return status, headers, body
+
+        if not action:
+            return 404, headers, ''
 
         raise NotImplementedError(
             "The {0} action has not been implemented".format(action))
@@ -214,6 +299,22 @@ class BaseResponse(_TemplateEnvironmentMixin):
         val = self.querystring.get(param_name)
         if val is not None:
             return val[0]
+
+        # try to get json body parameter
+        if self.body is not None:
+            try:
+                return json.loads(self.body)[param_name]
+            except ValueError:
+                pass
+            except KeyError:
+                pass
+        # try to get path parameter
+        if self.uri_match:
+            try:
+                return self.uri_match.group(param_name)
+            except IndexError:
+                # do nothing if param is not found
+                pass
         return if_none
 
     def _get_int_param(self, param_name, if_none=None):
@@ -231,6 +332,45 @@ class BaseResponse(_TemplateEnvironmentMixin):
                 return False
         return if_none
 
+    def _get_multi_param_helper(self, param_prefix):
+        value_dict = dict()
+        tracked_prefixes = set()  # prefixes which have already been processed
+
+        def is_tracked(name_param):
+            for prefix_loop in tracked_prefixes:
+                if name_param.startswith(prefix_loop):
+                    return True
+            return False
+
+        for name, value in self.querystring.items():
+            if is_tracked(name) or not name.startswith(param_prefix):
+                continue
+
+            if len(name) > len(param_prefix) and \
+                    not name[len(param_prefix):].startswith('.'):
+                continue
+
+            match = self.param_list_regex.search(name[len(param_prefix):]) if len(name) > len(param_prefix) else None
+            if match:
+                prefix = param_prefix + match.group(1)
+                value = self._get_multi_param(prefix)
+                tracked_prefixes.add(prefix)
+                name = prefix
+                value_dict[name] = value
+            else:
+                value_dict[name] = value[0]
+
+        if not value_dict:
+            return None
+
+        if len(value_dict) > 1:
+            # strip off period prefix
+            value_dict = {name[len(param_prefix) + 1:]: value for name, value in value_dict.items()}
+        else:
+            value_dict = list(value_dict.values())[0]
+
+        return value_dict
+
     def _get_multi_param(self, param_prefix):
         """
         Given a querystring of ?LaunchConfigurationNames.member.1=my-test-1&LaunchConfigurationNames.member.2=my-test-2
@@ -243,12 +383,13 @@ class BaseResponse(_TemplateEnvironmentMixin):
         values = []
         index = 1
         while True:
-            try:
-                values.append(self.querystring[prefix + str(index)][0])
-            except KeyError:
+            value_dict = self._get_multi_param_helper(prefix + str(index))
+            if not value_dict:
                 break
-            else:
-                index += 1
+
+            values.append(value_dict)
+            index += 1
+
         return values
 
     def _get_dict_param(self, param_prefix):
@@ -310,7 +451,7 @@ class BaseResponse(_TemplateEnvironmentMixin):
             param_index += 1
         return results
 
-    def _get_map_prefix(self, param_prefix):
+    def _get_map_prefix(self, param_prefix, key_end='.key', value_end='.value'):
         results = {}
         param_index = 1
         while 1:
@@ -319,9 +460,9 @@ class BaseResponse(_TemplateEnvironmentMixin):
             k, v = None, None
             for key, value in self.querystring.items():
                 if key.startswith(index_prefix):
-                    if key.endswith('.key'):
+                    if key.endswith(key_end):
                         k = value[0]
-                    elif key.endswith('.value'):
+                    elif key.endswith(value_end):
                         v = value[0]
 
             if not (k and v):
@@ -351,6 +492,54 @@ class BaseResponse(_TemplateEnvironmentMixin):
                 param_index += 1
 
         return results
+
+    def _get_object_map(self, prefix, name='Name', value='Value'):
+        """
+        Given a query dict like
+        {
+            Prefix.1.Name: [u'event'],
+            Prefix.1.Value.StringValue: [u'order_cancelled'],
+            Prefix.1.Value.DataType: [u'String'],
+            Prefix.2.Name: [u'store'],
+            Prefix.2.Value.StringValue: [u'example_corp'],
+            Prefix.2.Value.DataType [u'String'],
+        }
+
+        returns
+        {
+            'event': {
+                'DataType': 'String',
+                'StringValue': 'example_corp'
+            },
+            'store': {
+                'DataType': 'String',
+                'StringValue': 'order_cancelled'
+            }
+        }
+        """
+        object_map = {}
+        index = 1
+        while True:
+            # Loop through looking for keys representing object name
+            name_key = '{0}.{1}.{2}'.format(prefix, index, name)
+            obj_name = self.querystring.get(name_key)
+            if not obj_name:
+                # Found all keys
+                break
+
+            obj = {}
+            value_key_prefix = '{0}.{1}.{2}.'.format(
+                prefix, index, value)
+            for k, v in self.querystring.items():
+                if k.startswith(value_key_prefix):
+                    _, value_key = k.split(value_key_prefix, 1)
+                    obj[value_key] = v[0]
+
+            object_map[obj_name[0]] = obj
+
+            index += 1
+
+        return object_map
 
     @property
     def request_json(self):
@@ -414,6 +603,9 @@ class _RecursiveDictRef(object):
     def __getattr__(self, key):
         return self.dic.__getattr__(key)
 
+    def __getitem__(self, key):
+        return self.dic.__getitem__(key)
+
     def set_reference(self, key, dic):
         """Set the RecursiveDictRef object to keep reference to dict object
         (dic) at the key.
@@ -431,7 +623,7 @@ class AWSServiceSpec(object):
 
     def __init__(self, path):
         self.path = resource_filename('botocore', path)
-        with open(self.path) as f:
+        with io.open(self.path, 'r', encoding='utf-8') as f:
             spec = json.load(f)
         self.metadata = spec['metadata']
         self.operations = spec['operations']
@@ -526,6 +718,8 @@ def to_str(value, spec):
         return str(value)
     elif vtype == 'float':
         return str(value)
+    elif vtype == 'double':
+        return str(value)
     elif vtype == 'timestamp':
         return datetime.datetime.utcfromtimestamp(
             value).replace(tzinfo=pytz.utc).isoformat()
@@ -544,6 +738,8 @@ def from_str(value, spec):
     elif vtype == 'integer':
         return int(value)
     elif vtype == 'float':
+        return float(value)
+    elif vtype == 'double':
         return float(value)
     elif vtype == 'timestamp':
         return value

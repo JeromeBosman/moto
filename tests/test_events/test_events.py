@@ -1,9 +1,10 @@
 import random
-
 import boto3
+import json
 
 from moto.events import mock_events
-
+from botocore.exceptions import ClientError
+from nose.tools import assert_raises
 
 RULES = [
     {'Name': 'test1', 'ScheduleExpression': 'rate(5 minutes)'},
@@ -106,6 +107,13 @@ def test_enable_disable_rule():
     rule = client.describe_rule(Name=rule_name)
     assert(rule['State'] == 'ENABLED')
 
+    # Test invalid name
+    try:
+        client.enable_rule(Name='junk')
+
+    except ClientError as ce:
+        assert ce.response['Error']['Code'] == 'ResourceNotFoundException'
+
 
 @mock_events
 def test_list_rule_names_by_target():
@@ -171,11 +179,38 @@ def test_remove_targets():
     assert(targets_before - 1 == targets_after)
 
 
-if __name__ == '__main__':
-    test_list_rules()
-    test_describe_rule()
-    test_enable_disable_rule()
-    test_list_rule_names_by_target()
-    test_list_rules()
-    test_list_targets_by_rule()
-    test_remove_targets()
+@mock_events
+def test_permissions():
+    client = boto3.client('events', 'eu-central-1')
+
+    client.put_permission(Action='events:PutEvents', Principal='111111111111', StatementId='Account1')
+    client.put_permission(Action='events:PutEvents', Principal='222222222222', StatementId='Account2')
+
+    resp = client.describe_event_bus()
+    resp_policy = json.loads(resp['Policy'])
+    assert len(resp_policy['Statement']) == 2
+
+    client.remove_permission(StatementId='Account2')
+
+    resp = client.describe_event_bus()
+    resp_policy = json.loads(resp['Policy'])
+    assert len(resp_policy['Statement']) == 1
+    assert resp_policy['Statement'][0]['Sid'] == 'Account1'
+
+
+@mock_events
+def test_put_events():
+    client = boto3.client('events', 'eu-central-1')
+
+    event = {
+        "Source": "com.mycompany.myapp",
+        "Detail": '{"key1": "value3", "key2": "value4"}',
+        "Resources": ["resource1", "resource2"],
+        "DetailType": "myDetailType"
+    }
+
+    client.put_events(Entries=[event])
+    # Boto3 would error if it didn't return 200 OK
+
+    with assert_raises(ClientError):
+        client.put_events(Entries=[event]*20)

@@ -2,8 +2,8 @@
 
 [![Join the chat at https://gitter.im/awsmoto/Lobby](https://badges.gitter.im/awsmoto/Lobby.svg)](https://gitter.im/awsmoto/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
-[![Build Status](https://travis-ci.org/spulec/moto.png?branch=master)](https://travis-ci.org/spulec/moto)
-[![Coverage Status](https://coveralls.io/repos/spulec/moto/badge.png?branch=master)](https://coveralls.io/r/spulec/moto)
+[![Build Status](https://travis-ci.org/spulec/moto.svg?branch=master)](https://travis-ci.org/spulec/moto)
+[![Coverage Status](https://coveralls.io/repos/spulec/moto/badge.svg?branch=master)](https://coveralls.io/r/spulec/moto)
 [![Docs](https://readthedocs.org/projects/pip/badge/?version=stable)](http://docs.getmoto.org)
 
 # In a nutshell
@@ -58,6 +58,8 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | Service Name          | Decorator        | Development Status                |
 |------------------------------------------------------------------------------|
+| ACM                   | @mock_acm        | all endpoints done                |
+|------------------------------------------------------------------------------|
 | API Gateway           | @mock_apigateway | core endpoints done               |
 |------------------------------------------------------------------------------|
 | Autoscaling           | @mock_autoscaling| core endpoints done               |
@@ -66,10 +68,18 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | Cloudwatch            | @mock_cloudwatch | basic endpoints done              |
 |------------------------------------------------------------------------------|
+| CloudwatchEvents      | @mock_events     | all endpoints done                |
+|------------------------------------------------------------------------------|
+| Cognito Identity      | @mock_cognitoidentity| basic endpoints done          |
+|------------------------------------------------------------------------------|
+| Cognito Identity Provider | @mock_cognitoidp| basic endpoints done           |
+|------------------------------------------------------------------------------|
+| Config | @mock_config | basic endpoints done                                 |
+|------------------------------------------------------------------------------|
 | Data Pipeline         | @mock_datapipeline| basic endpoints done             |
 |------------------------------------------------------------------------------|
 | DynamoDB              | @mock_dynamodb   | core endpoints done               |
-| DynamoDB2             | @mock_dynamodb2  | core endpoints + partial indexes  |
+| DynamoDB2             | @mock_dynamodb2  | all endpoints + partial indexes   |
 |------------------------------------------------------------------------------|
 | EC2                   | @mock_ec2        | core endpoints done               |
 |     - AMI             |                  | core endpoints done               |
@@ -78,9 +88,13 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |     - Security Groups |                  | core endpoints done               |
 |     - Tags            |                  | all  endpoints done               |
 |------------------------------------------------------------------------------|
+| ECR                   | @mock_ecr        | basic endpoints done              |
+|------------------------------------------------------------------------------|
 | ECS                   | @mock_ecs        | basic endpoints done              |
 |------------------------------------------------------------------------------|
 | ELB                   | @mock_elb        | core endpoints done               |
+|------------------------------------------------------------------------------|
+| ELBv2                 | @mock_elbv2      | all endpoints done                |
 |------------------------------------------------------------------------------|
 | EMR                   | @mock_emr        | core endpoints done               |
 |------------------------------------------------------------------------------|
@@ -88,11 +102,21 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | IAM                   | @mock_iam        | core endpoints done               |
 |------------------------------------------------------------------------------|
-| Lambda                | @mock_lambda     | basic endpoints done              |
+| IoT                   | @mock_iot        | core endpoints done               |
+|                       | @mock_iotdata    | core endpoints done               |
+|------------------------------------------------------------------------------|
+| Lambda                | @mock_lambda     | basic endpoints done, requires    |
+|                       |                  | docker                            |
+|------------------------------------------------------------------------------|
+| Logs                  | @mock_logs       | basic endpoints done              |
 |------------------------------------------------------------------------------|
 | Kinesis               | @mock_kinesis    | core endpoints done               |
 |------------------------------------------------------------------------------|
 | KMS                   | @mock_kms        | basic endpoints done              |
+|------------------------------------------------------------------------------|
+| Organizations         | @mock_organizations | some core endpoints done       |
+|------------------------------------------------------------------------------|
+| Polly                 | @mock_polly      | all endpoints done                |
 |------------------------------------------------------------------------------|
 | RDS                   | @mock_rds        | core endpoints done               |
 |------------------------------------------------------------------------------|
@@ -104,45 +128,76 @@ It gets even better! Moto isn't just for Python code and it isn't just for S3. L
 |------------------------------------------------------------------------------|
 | S3                    | @mock_s3         | core endpoints done               |
 |------------------------------------------------------------------------------|
-| SES                   | @mock_ses        | core endpoints done               |
+| SecretsManager        | @mock_secretsmanager | basic endpoints done
 |------------------------------------------------------------------------------|
-| SNS                   | @mock_sns        | core endpoints done               |
+| SES                   | @mock_ses        | all endpoints done                |
+|------------------------------------------------------------------------------|
+| SNS                   | @mock_sns        | all endpoints done                |
 |------------------------------------------------------------------------------|
 | SQS                   | @mock_sqs        | core endpoints done               |
 |------------------------------------------------------------------------------|
+| SSM                   | @mock_ssm        | core endpoints done               |
+|------------------------------------------------------------------------------|
 | STS                   | @mock_sts        | core endpoints done               |
 |------------------------------------------------------------------------------|
-| SWF                   | @mock_sfw        | basic endpoints done              |
+| SWF                   | @mock_swf        | basic endpoints done              |
+|------------------------------------------------------------------------------|
+| X-Ray                 | @mock_xray       | all endpoints done                |
 |------------------------------------------------------------------------------|
 ```
+
+For a full list of endpoint [implementation coverage](https://github.com/spulec/moto/blob/master/IMPLEMENTATION_COVERAGE.md)
 
 ### Another Example
 
 Imagine you have a function that you use to launch new ec2 instances:
 
 ```python
-import boto
+import boto3
+
 
 def add_servers(ami_id, count):
-    conn = boto.connect_ec2('the_key', 'the_secret')
-    for index in range(count):
-        conn.run_instances(ami_id)
+    client = boto3.client('ec2', region_name='us-west-1')
+    client.run_instances(ImageId=ami_id, MinCount=count, MaxCount=count)
 ```
 
 To test it:
 
 ```python
 from . import add_servers
+from moto import mock_ec2
 
 @mock_ec2
 def test_add_servers():
     add_servers('ami-1234abcd', 2)
 
-    conn = boto.connect_ec2('the_key', 'the_secret')
-    reservations = conn.get_all_instances()
-    assert len(reservations) == 2
-    instance1 = reservations[0].instances[0]
-    assert instance1.image_id == 'ami-1234abcd'
+    client = boto3.client('ec2', region_name='us-west-1')
+    instances = client.describe_instances()['Reservations'][0]['Instances']
+    assert len(instances) == 2
+    instance1 = instances[0]
+    assert instance1['ImageId'] == 'ami-1234abcd'
+```
+
+#### Using moto 1.0.X with boto2
+moto 1.0.X mock decorators are defined for boto3 and do not work with boto2. Use the @mock_AWSSVC_deprecated to work with boto2.
+
+Using moto with boto2
+```python
+from moto import mock_ec2_deprecated
+import boto
+
+@mock_ec2_deprecated
+def test_something_with_ec2():
+    ec2_conn = boto.ec2.connect_to_region('us-east-1')
+    ec2_conn.get_only_instances(instance_ids='i-123456')
+
+```
+
+When using both boto2 and boto3, one can do this to avoid confusion:
+```python
+from moto import mock_ec2_deprecated as mock_ec2_b2
+from moto import mock_ec2
+
 ```
 
 ## Usage
@@ -154,13 +209,14 @@ All of the services can be used as a decorator, context manager, or in a raw for
 ```python
 @mock_s3
 def test_my_model_save():
-    conn = boto.connect_s3()
-    conn.create_bucket('mybucket')
-
+    # Create Bucket so that test can run
+    conn = boto3.resource('s3', region_name='us-east-1')
+    conn.create_bucket(Bucket='mybucket')
     model_instance = MyModel('steve', 'is awesome')
     model_instance.save()
+    body = conn.Object('mybucket', 'steve').get()['Body'].read().decode()
 
-    assert conn.get_bucket('mybucket').get_key('steve').get_contents_as_string() == 'is awesome'
+    assert body == 'is awesome'
 ```
 
 ### Context Manager
@@ -168,13 +224,13 @@ def test_my_model_save():
 ```python
 def test_my_model_save():
     with mock_s3():
-        conn = boto.connect_s3()
-        conn.create_bucket('mybucket')
-
+        conn = boto3.resource('s3', region_name='us-east-1')
+        conn.create_bucket(Bucket='mybucket')
         model_instance = MyModel('steve', 'is awesome')
         model_instance.save()
+        body = conn.Object('mybucket', 'steve').get()['Body'].read().decode()
 
-        assert conn.get_bucket('mybucket').get_key('steve').get_contents_as_string() == 'is awesome'
+        assert body == 'is awesome'
 ```
 
 
@@ -185,13 +241,13 @@ def test_my_model_save():
     mock = mock_s3()
     mock.start()
 
-    conn = boto.connect_s3()
-    conn.create_bucket('mybucket')
+    conn = boto3.resource('s3', region_name='us-east-1')
+    conn.create_bucket(Bucket='mybucket')
 
     model_instance = MyModel('steve', 'is awesome')
     model_instance.save()
 
-    assert conn.get_bucket('mybucket').get_key('steve').get_contents_as_string() == 'is awesome'
+    assert conn.Object('mybucket', 'steve').get()['Body'].read().decode() == 'is awesome'
 
     mock.stop()
 ```
@@ -205,7 +261,7 @@ It uses flask, which isn't a default dependency. You can install the
 server 'extra' package with:
 
 ```python
-pip install moto[server]
+pip install "moto[server]"
 ```
 
 You can then start it running a service:
@@ -257,6 +313,7 @@ boto3.resource(
 ```
 
 ## Install
+
 
 ```console
 $ pip install moto

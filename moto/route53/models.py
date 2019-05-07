@@ -2,11 +2,20 @@ from __future__ import unicode_literals
 
 from collections import defaultdict
 
+import string
+import random
 import uuid
 from jinja2 import Template
 
 from moto.core import BaseBackend, BaseModel
-from moto.core.utils import get_random_hex
+
+
+ROUTE53_ID_CHOICE = string.ascii_uppercase + string.digits
+
+
+def create_route53_zone_id():
+    # New ID's look like this Z1RWWTK7Y8UDDQ
+    return ''.join([random.choice(ROUTE53_ID_CHOICE) for _ in range(0, 15)])
 
 
 class HealthCheck(BaseModel):
@@ -15,7 +24,7 @@ class HealthCheck(BaseModel):
         self.id = health_check_id
         self.ip_address = health_check_args.get("ip_address")
         self.port = health_check_args.get("port", 80)
-        self._type = health_check_args.get("type")
+        self.type_ = health_check_args.get("type")
         self.resource_path = health_check_args.get("resource_path")
         self.fqdn = health_check_args.get("fqdn")
         self.search_string = health_check_args.get("search_string")
@@ -49,7 +58,7 @@ class HealthCheck(BaseModel):
             <HealthCheckConfig>
                 <IPAddress>{{ health_check.ip_address }}</IPAddress>
                 <Port>{{ health_check.port }}</Port>
-                <Type>{{ health_check._type }}</Type>
+                <Type>{{ health_check.type_ }}</Type>
                 <ResourcePath>{{ health_check.resource_path }}</ResourcePath>
                 <FullyQualifiedDomainName>{{ health_check.fqdn }}</FullyQualifiedDomainName>
                 <RequestInterval>{{ health_check.request_interval }}</RequestInterval>
@@ -67,7 +76,7 @@ class RecordSet(BaseModel):
 
     def __init__(self, kwargs):
         self.name = kwargs.get('Name')
-        self._type = kwargs.get('Type')
+        self.type_ = kwargs.get('Type')
         self.ttl = kwargs.get('TTL')
         self.records = kwargs.get('ResourceRecords', [])
         self.set_identifier = kwargs.get('SetIdentifier')
@@ -121,7 +130,7 @@ class RecordSet(BaseModel):
     def to_xml(self):
         template = Template("""<ResourceRecordSet>
                 <Name>{{ record_set.name }}</Name>
-                <Type>{{ record_set._type }}</Type>
+                <Type>{{ record_set.type_ }}</Type>
                 {% if record_set.set_identifier %}
                     <SetIdentifier>{{ record_set.set_identifier }}</SetIdentifier>
                 {% endif %}
@@ -131,7 +140,9 @@ class RecordSet(BaseModel):
                 {% if record_set.region %}
                     <Region>{{ record_set.region }}</Region>
                 {% endif %}
-                <TTL>{{ record_set.ttl }}</TTL>
+                {% if record_set.ttl %}
+                    <TTL>{{ record_set.ttl }}</TTL>
+                {% endif %}
                 <ResourceRecords>
                     {% for record in record_set.records %}
                     <ResourceRecord>
@@ -172,7 +183,7 @@ class FakeZone(BaseModel):
     def upsert_rrset(self, record_set):
         new_rrset = RecordSet(record_set)
         for i, rrset in enumerate(self.rrsets):
-            if rrset.name == new_rrset.name:
+            if rrset.name == new_rrset.name and rrset.type_ == new_rrset.type_:
                 self.rrsets[i] = new_rrset
                 break
         else:
@@ -187,20 +198,20 @@ class FakeZone(BaseModel):
         self.rrsets = [
             record_set for record_set in self.rrsets if record_set.set_identifier != set_identifier]
 
-    def get_record_sets(self, type_filter, name_filter):
+    def get_record_sets(self, start_type, start_name):
         record_sets = list(self.rrsets)  # Copy the list
-        if type_filter:
+        if start_type:
             record_sets = [
-                record_set for record_set in record_sets if record_set._type == type_filter]
-        if name_filter:
+                record_set for record_set in record_sets if record_set.type_ >= start_type]
+        if start_name:
             record_sets = [
-                record_set for record_set in record_sets if record_set.name == name_filter]
+                record_set for record_set in record_sets if record_set.name >= start_name]
 
         return record_sets
 
     @property
     def physical_resource_id(self):
-        return self.name
+        return self.id
 
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
@@ -247,7 +258,7 @@ class Route53Backend(BaseBackend):
         self.resource_tags = defaultdict(dict)
 
     def create_hosted_zone(self, name, private_zone, comment=None):
-        new_id = get_random_hex()
+        new_id = create_route53_zone_id()
         new_zone = FakeZone(
             name, new_id, private_zone=private_zone, comment=comment)
         self.zones[new_id] = new_zone

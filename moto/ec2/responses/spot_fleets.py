@@ -29,9 +29,18 @@ class SpotFleets(BaseResponse):
         template = self.response_template(DESCRIBE_SPOT_FLEET_TEMPLATE)
         return template.render(requests=requests)
 
+    def modify_spot_fleet_request(self):
+        spot_fleet_request_id = self._get_param("SpotFleetRequestId")
+        target_capacity = self._get_int_param("TargetCapacity")
+        terminate_instances = self._get_param("ExcessCapacityTerminationPolicy", if_none="Default")
+        successful = self.ec2_backend.modify_spot_fleet_request(
+            spot_fleet_request_id, target_capacity, terminate_instances)
+        template = self.response_template(MODIFY_SPOT_FLEET_REQUEST_TEMPLATE)
+        return template.render(successful=successful)
+
     def request_spot_fleet(self):
         spot_config = self._get_dict_param("SpotFleetRequestConfig.")
-        spot_price = spot_config['spot_price']
+        spot_price = spot_config.get('spot_price')
         target_capacity = spot_config['target_capacity']
         iam_fleet_role = spot_config['iam_fleet_role']
         allocation_strategy = spot_config['allocation_strategy']
@@ -56,6 +65,11 @@ REQUEST_SPOT_FLEET_TEMPLATE = """<RequestSpotFleetResponse xmlns="http://ec2.ama
     <spotFleetRequestId>{{ request.id }}</spotFleetRequestId>
 </RequestSpotFleetResponse>"""
 
+MODIFY_SPOT_FLEET_REQUEST_TEMPLATE = """<ModifySpotFleetRequestResponse xmlns="http://ec2.amazonaws.com/doc/2016-09-15/">
+    <requestId>21681fea-9987-aef3-2121-example</requestId>
+    <return>{{ 'true' if successful else 'false' }}</return>
+</ModifySpotFleetRequestResponse>"""
+
 DESCRIBE_SPOT_FLEET_TEMPLATE = """<DescribeSpotFleetRequestsResponse xmlns="http://ec2.amazonaws.com/doc/2016-09-15/">
     <requestId>4d68a6cc-8f2e-4be1-b425-example</requestId>
     <spotFleetRequestConfigSet>
@@ -64,7 +78,9 @@ DESCRIBE_SPOT_FLEET_TEMPLATE = """<DescribeSpotFleetRequestsResponse xmlns="http
             <spotFleetRequestId>{{ request.id }}</spotFleetRequestId>
             <spotFleetRequestState>{{ request.state }}</spotFleetRequestState>
             <spotFleetRequestConfig>
+                {% if request.spot_price %}
                 <spotPrice>{{ request.spot_price }}</spotPrice>
+                {% endif %}
                 <targetCapacity>{{ request.target_capacity }}</targetCapacity>
                 <iamFleetRole>{{ request.iam_fleet_role }}</iamFleetRole>
                 <allocationStrategy>{{ request.allocation_strategy }}</allocationStrategy>
@@ -79,7 +95,9 @@ DESCRIBE_SPOT_FLEET_TEMPLATE = """<DescribeSpotFleetRequestsResponse xmlns="http
                         <iamInstanceProfile><arn>{{ launch_spec.iam_instance_profile }}</arn></iamInstanceProfile>
                         <keyName>{{ launch_spec.key_name }}</keyName>
                         <monitoring><enabled>{{ launch_spec.monitoring }}</enabled></monitoring>
+                        {% if launch_spec.spot_price %}
                         <spotPrice>{{ launch_spec.spot_price }}</spotPrice>
+                        {% endif %}
                         <userData>{{ launch_spec.user_data }}</userData>
                         <weightedCapacity>{{ launch_spec.weighted_capacity }}</weightedCapacity>
                         <groupSet>
@@ -89,6 +107,21 @@ DESCRIBE_SPOT_FLEET_TEMPLATE = """<DescribeSpotFleetRequestsResponse xmlns="http
                             </item>
                             {% endfor %}
                         </groupSet>
+                        <tagSpecificationSet>
+                            {% for resource_type in launch_spec.tag_specifications %}
+                            <item>
+                                <resourceType>{{ resource_type }}</resourceType>
+                                <tag>
+                                {% for key, value in launch_spec.tag_specifications[resource_type].items() %}
+                                    <item>
+                                        <key>{{ key }}</key>
+                                        <value>{{ value }}</value>
+                                    </item>
+                                {% endfor %}
+                                </tag>
+                            </item>
+                            {% endfor %}
+                        </tagSpecificationSet>
                     </item>
                     {% endfor %}
                 </launchSpecifications>

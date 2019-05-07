@@ -1,10 +1,17 @@
 from __future__ import unicode_literals
+from functools import wraps
 
+import binascii
 import datetime
 import inspect
 import random
 import re
 import six
+import string
+from six.moves.urllib.parse import urlparse
+
+
+REQUEST_ID_LONG = string.digits + string.ascii_uppercase
 
 
 def camelcase_to_underscores(argument):
@@ -12,6 +19,8 @@ def camelcase_to_underscores(argument):
     python underscore variable like the_new_attribute'''
     result = ''
     prev_char_title = True
+    if not argument:
+        return argument
     for index, char in enumerate(argument):
         try:
             next_char_title = argument[index + 1].istitle()
@@ -174,9 +183,15 @@ def iso_8601_datetime_without_milliseconds(datetime):
     return datetime.strftime("%Y-%m-%dT%H:%M:%S") + 'Z'
 
 
+RFC1123 = '%a, %d %b %Y %H:%M:%S GMT'
+
+
 def rfc_1123_datetime(datetime):
-    RFC1123 = '%a, %d %b %Y %H:%M:%S GMT'
     return datetime.strftime(RFC1123)
+
+
+def str_to_rfc_1123_datetime(str):
+    return datetime.datetime.strptime(str, RFC1123)
 
 
 def unix_time(dt=None):
@@ -188,3 +203,97 @@ def unix_time(dt=None):
 
 def unix_time_millis(dt=None):
     return unix_time(dt) * 1000.0
+
+
+def gen_amz_crc32(response, headerdict=None):
+    if not isinstance(response, bytes):
+        response = response.encode()
+
+    crc = str(binascii.crc32(response))
+
+    if headerdict is not None and isinstance(headerdict, dict):
+        headerdict.update({'x-amz-crc32': crc})
+
+    return crc
+
+
+def gen_amzn_requestid_long(headerdict=None):
+    req_id = ''.join([random.choice(REQUEST_ID_LONG) for _ in range(0, 52)])
+
+    if headerdict is not None and isinstance(headerdict, dict):
+        headerdict.update({'x-amzn-requestid': req_id})
+
+    return req_id
+
+
+def amz_crc32(f):
+    @wraps(f)
+    def _wrapper(*args, **kwargs):
+        response = f(*args, **kwargs)
+
+        headers = {}
+        status = 200
+
+        if isinstance(response, six.string_types):
+            body = response
+        else:
+            if len(response) == 2:
+                body, new_headers = response
+                status = new_headers.get('status', 200)
+            else:
+                status, new_headers, body = response
+            headers.update(new_headers)
+            # Cast status to string
+            if "status" in headers:
+                headers['status'] = str(headers['status'])
+
+        try:
+            # Doesnt work on python2 for some odd unicode strings
+            gen_amz_crc32(body, headers)
+        except Exception:
+            pass
+
+        return status, headers, body
+
+    return _wrapper
+
+
+def amzn_request_id(f):
+    @wraps(f)
+    def _wrapper(*args, **kwargs):
+        response = f(*args, **kwargs)
+
+        headers = {}
+        status = 200
+
+        if isinstance(response, six.string_types):
+            body = response
+        else:
+            if len(response) == 2:
+                body, new_headers = response
+                status = new_headers.get('status', 200)
+            else:
+                status, new_headers, body = response
+            headers.update(new_headers)
+
+        request_id = gen_amzn_requestid_long(headers)
+
+        # Update request ID in XML
+        try:
+            body = re.sub(r'(?<=<RequestId>).*(?=<\/RequestId>)', request_id, body)
+        except Exception:  # Will just ignore if it cant work on bytes (which are str's on python2)
+            pass
+
+        return status, headers, body
+
+    return _wrapper
+
+
+def path_url(url):
+    parsed_url = urlparse(url)
+    path = parsed_url.path
+    if not path:
+        path = '/'
+    if parsed_url.query:
+        path = path + '?' + parsed_url.query
+    return path

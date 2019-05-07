@@ -348,6 +348,15 @@ def test_get_all_security_groups():
     resp.should.have.length_of(1)
     resp[0].id.should.equal(sg1.id)
 
+    with assert_raises(EC2ResponseError) as cm:
+        conn.get_all_security_groups(groupnames=['does_not_exist'])
+    cm.exception.code.should.equal('InvalidGroup.NotFound')
+    cm.exception.status.should.equal(400)
+    cm.exception.request_id.should_not.be.none
+
+    resp.should.have.length_of(1)
+    resp[0].id.should.equal(sg1.id)
+
     resp = conn.get_all_security_groups(filters={'vpc-id': ['vpc-mjm05d27']})
     resp.should.have.length_of(1)
     resp[0].id.should.equal(sg1.id)
@@ -605,6 +614,20 @@ def test_security_group_tagging_boto3():
 
 
 @mock_ec2
+def test_security_group_wildcard_tag_filter_boto3():
+    conn = boto3.client('ec2', region_name='us-east-1')
+    sg = conn.create_security_group(GroupName="test-sg", Description="Test SG")
+    conn.create_tags(Resources=[sg['GroupId']], Tags=[
+                     {'Key': 'Test', 'Value': 'Tag'}])
+    describe = conn.describe_security_groups(
+        Filters=[{'Name': 'tag-value', 'Values': ['*']}])
+
+    tag = describe["SecurityGroups"][0]['Tags'][0]
+    tag['Value'].should.equal("Tag")
+    tag['Key'].should.equal("Test")
+
+
+@mock_ec2
 def test_authorize_and_revoke_in_bulk():
     ec2 = boto3.resource('ec2', region_name='us-west-1')
 
@@ -666,6 +689,31 @@ def test_authorize_and_revoke_in_bulk():
         sg01.ip_permissions_egress.shouldnt.contain(ip_permission)
 
 
+@mock_ec2
+def test_security_group_ingress_without_multirule():
+    ec2 = boto3.resource('ec2', 'ca-central-1')
+    sg = ec2.create_security_group(Description='Test SG', GroupName='test-sg')
+
+    assert len(sg.ip_permissions) == 0
+    sg.authorize_ingress(CidrIp='192.168.0.1/32', FromPort=22, ToPort=22, IpProtocol='tcp')
+
+    # Fails
+    assert len(sg.ip_permissions) == 1
+
+
+@mock_ec2
+def test_security_group_ingress_without_multirule_after_reload():
+    ec2 = boto3.resource('ec2', 'ca-central-1')
+    sg = ec2.create_security_group(Description='Test SG', GroupName='test-sg')
+
+    assert len(sg.ip_permissions) == 0
+    sg.authorize_ingress(CidrIp='192.168.0.1/32', FromPort=22, ToPort=22, IpProtocol='tcp')
+
+    # Also Fails
+    sg_after = ec2.SecurityGroup(sg.id)
+    assert len(sg_after.ip_permissions) == 1
+
+
 @mock_ec2_deprecated
 def test_get_all_security_groups_filter_with_same_vpc_id():
     conn = boto.connect_ec2('the_key', 'the_secret')
@@ -681,3 +729,9 @@ def test_get_all_security_groups_filter_with_same_vpc_id():
     security_groups = conn.get_all_security_groups(
         group_ids=[security_group.id], filters={'vpc-id': [vpc_id]})
     security_groups.should.have.length_of(1)
+
+    with assert_raises(EC2ResponseError) as cm:
+        conn.get_all_security_groups(group_ids=['does_not_exist'])
+    cm.exception.code.should.equal('InvalidGroup.NotFound')
+    cm.exception.status.should.equal(400)
+    cm.exception.request_id.should_not.be.none

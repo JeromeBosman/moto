@@ -1,20 +1,30 @@
+# -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 from __future__ import absolute_import
 
-from collections import defaultdict
 import functools
 import inspect
+import os
 import re
 import six
+from io import BytesIO
+from collections import defaultdict
+from botocore.handlers import BUILTIN_HANDLERS
+from botocore.awsrequest import AWSResponse
 
 from moto import settings
-from moto.packages.responses import responses
+import responses
 from moto.packages.httpretty import HTTPretty
 from .utils import (
     convert_httpretty_response,
     convert_regex_to_flask_path,
     convert_flask_to_responses_response,
 )
+
+
+# "Mock" the AWS credentials as they can't be mocked in Botocore currently
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "foobar_key")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "foobar_secret")
 
 
 class BaseMockAWS(object):
@@ -88,6 +98,17 @@ class BaseMockAWS(object):
             if inspect.ismethod(attr_value) and attr_value.__self__ is klass:
                 continue
 
+            # Check if this is a staticmethod. If so, skip patching
+            for cls in inspect.getmro(klass):
+                if attr_value.__name__ not in cls.__dict__:
+                    continue
+                bound_attr_value = cls.__dict__[attr_value.__name__]
+                if not isinstance(bound_attr_value, staticmethod):
+                    break
+            else:
+                # It is a staticmethod, skip patching
+                continue
+
             try:
                 setattr(klass, attr, self(attr_value, reset=False))
             except TypeError:
@@ -123,34 +144,209 @@ RESPONSES_METHODS = [responses.GET, responses.DELETE, responses.HEAD,
                      responses.OPTIONS, responses.PATCH, responses.POST, responses.PUT]
 
 
-class ResponsesMockAWS(BaseMockAWS):
+class CallbackResponse(responses.CallbackResponse):
+    '''
+    Need to subclass so we can change a couple things
+    '''
+    def get_response(self, request):
+        '''
+        Need to override this so we can pass decode_content=False
+        '''
+        headers = self.get_headers()
 
+        result = self.callback(request)
+        if isinstance(result, Exception):
+            raise result
+
+        status, r_headers, body = result
+        body = responses._handle_body(body)
+        headers.update(r_headers)
+
+        return responses.HTTPResponse(
+            status=status,
+            reason=six.moves.http_client.responses.get(status),
+            body=body,
+            headers=headers,
+            preload_content=False,
+            # Need to not decode_content to mimic requests
+            decode_content=False,
+        )
+
+    def _url_matches(self, url, other, match_querystring=False):
+        '''
+        Need to override this so we can fix querystrings breaking regex matching
+        '''
+        if not match_querystring:
+            other = other.split('?', 1)[0]
+
+        if responses._is_string(url):
+            if responses._has_unicode(url):
+                url = responses._clean_unicode(url)
+                if not isinstance(other, six.text_type):
+                    other = other.encode('ascii').decode('utf8')
+            return self._url_matches_strict(url, other)
+        elif isinstance(url, responses.Pattern) and url.match(other):
+            return True
+        else:
+            return False
+
+
+botocore_mock = responses.RequestsMock(assert_all_requests_are_fired=False, target='botocore.vendored.requests.adapters.HTTPAdapter.send')
+responses_mock = responses._default_mock
+
+
+class ResponsesMockAWS(BaseMockAWS):
     def reset(self):
-        responses.reset()
+        botocore_mock.reset()
+        responses_mock.reset()
 
     def enable_patching(self):
-        responses.start()
+        if not hasattr(botocore_mock, '_patcher') or not hasattr(botocore_mock._patcher, 'target'):
+            # Check for unactivated patcher
+            botocore_mock.start()
+
+        if not hasattr(responses_mock, '_patcher') or not hasattr(responses_mock._patcher, 'target'):
+            responses_mock.start()
+
         for method in RESPONSES_METHODS:
             for backend in self.backends_for_urls.values():
                 for key, value in backend.urls.items():
-                    responses.add_callback(
-                        method=method,
-                        url=re.compile(key),
-                        callback=convert_flask_to_responses_response(value),
+                    responses_mock.add(
+                        CallbackResponse(
+                            method=method,
+                            url=re.compile(key),
+                            callback=convert_flask_to_responses_response(value),
+                            stream=True,
+                            match_querystring=False,
+                        )
                     )
-
-        for pattern in responses.mock._urls:
-            pattern['stream'] = True
+                    botocore_mock.add(
+                        CallbackResponse(
+                            method=method,
+                            url=re.compile(key),
+                            callback=convert_flask_to_responses_response(value),
+                            stream=True,
+                            match_querystring=False,
+                        )
+                    )
 
     def disable_patching(self):
         try:
-            responses.stop()
-        except AttributeError:
+            botocore_mock.stop()
+        except RuntimeError:
             pass
-        responses.reset()
+
+        try:
+            responses_mock.stop()
+        except RuntimeError:
+            pass
 
 
-MockAWS = ResponsesMockAWS
+BOTOCORE_HTTP_METHODS = [
+    'GET', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'
+]
+
+
+class MockRawResponse(BytesIO):
+    def __init__(self, input):
+        if isinstance(input, six.text_type):
+            input = input.encode('utf-8')
+        super(MockRawResponse, self).__init__(input)
+
+    def stream(self, **kwargs):
+        contents = self.read()
+        while contents:
+            yield contents
+            contents = self.read()
+
+
+class BotocoreStubber(object):
+    def __init__(self):
+        self.enabled = False
+        self.methods = defaultdict(list)
+
+    def reset(self):
+        self.methods.clear()
+
+    def register_response(self, method, pattern, response):
+        matchers = self.methods[method]
+        matchers.append((pattern, response))
+
+    def __call__(self, event_name, request, **kwargs):
+        if not self.enabled:
+            return None
+
+        response = None
+        response_callback = None
+        found_index = None
+        matchers = self.methods.get(request.method)
+
+        base_url = request.url.split('?', 1)[0]
+        for i, (pattern, callback) in enumerate(matchers):
+            if pattern.match(base_url):
+                if found_index is None:
+                    found_index = i
+                    response_callback = callback
+                else:
+                    matchers.pop(found_index)
+                    break
+
+        if response_callback is not None:
+            for header, value in request.headers.items():
+                if isinstance(value, six.binary_type):
+                    request.headers[header] = value.decode('utf-8')
+            status, headers, body = response_callback(request, request.url, request.headers)
+            body = MockRawResponse(body)
+            response = AWSResponse(request.url, status, headers, body)
+
+        return response
+
+
+botocore_stubber = BotocoreStubber()
+BUILTIN_HANDLERS.append(('before-send', botocore_stubber))
+
+
+class BotocoreEventMockAWS(BaseMockAWS):
+    def reset(self):
+        botocore_stubber.reset()
+        responses_mock.reset()
+
+    def enable_patching(self):
+        botocore_stubber.enabled = True
+        for method in BOTOCORE_HTTP_METHODS:
+            for backend in self.backends_for_urls.values():
+                for key, value in backend.urls.items():
+                    pattern = re.compile(key)
+                    botocore_stubber.register_response(method, pattern, value)
+
+        if not hasattr(responses_mock, '_patcher') or not hasattr(responses_mock._patcher, 'target'):
+            responses_mock.start()
+
+        for method in RESPONSES_METHODS:
+            # for backend in default_backends.values():
+            for backend in self.backends_for_urls.values():
+                for key, value in backend.urls.items():
+                    responses_mock.add(
+                        CallbackResponse(
+                            method=method,
+                            url=re.compile(key),
+                            callback=convert_flask_to_responses_response(value),
+                            stream=True,
+                            match_querystring=False,
+                        )
+                    )
+
+    def disable_patching(self):
+        botocore_stubber.enabled = False
+        self.reset()
+
+        try:
+            responses_mock.stop()
+        except RuntimeError:
+            pass
+
+
+MockAWS = BotocoreEventMockAWS
 
 
 class ServerModeMockAWS(BaseMockAWS):
@@ -176,16 +372,49 @@ class ServerModeMockAWS(BaseMockAWS):
             if 'endpoint_url' not in kwargs:
                 kwargs['endpoint_url'] = "http://localhost:5000"
             return real_boto3_resource(*args, **kwargs)
+
+        def fake_httplib_send_output(self, message_body=None, *args, **kwargs):
+            def _convert_to_bytes(mixed_buffer):
+                bytes_buffer = []
+                for chunk in mixed_buffer:
+                    if isinstance(chunk, six.text_type):
+                        bytes_buffer.append(chunk.encode('utf-8'))
+                    else:
+                        bytes_buffer.append(chunk)
+                msg = b"\r\n".join(bytes_buffer)
+                return msg
+
+            self._buffer.extend((b"", b""))
+            msg = _convert_to_bytes(self._buffer)
+            del self._buffer[:]
+            if isinstance(message_body, bytes):
+                msg += message_body
+                message_body = None
+            self.send(msg)
+            # if self._expect_header_set:
+            #     read, write, exc = select.select([self.sock], [], [self.sock], 1)
+            #     if read:
+            #         self._handle_expect_response(message_body)
+            #         return
+            if message_body is not None:
+                self.send(message_body)
+
         self._client_patcher = mock.patch('boto3.client', fake_boto3_client)
-        self._resource_patcher = mock.patch(
-            'boto3.resource', fake_boto3_resource)
+        self._resource_patcher = mock.patch('boto3.resource', fake_boto3_resource)
+        if six.PY2:
+            self._httplib_patcher = mock.patch('httplib.HTTPConnection._send_output', fake_httplib_send_output)
+
         self._client_patcher.start()
         self._resource_patcher.start()
+        if six.PY2:
+            self._httplib_patcher.start()
 
     def disable_patching(self):
         if self._client_patcher:
             self._client_patcher.stop()
             self._resource_patcher.stop()
+            if six.PY2:
+                self._httplib_patcher.stop()
 
 
 class Model(type):
@@ -229,10 +458,7 @@ class InstanceTrackerMeta(type):
 @six.add_metaclass(InstanceTrackerMeta)
 class BaseModel(object):
     def __new__(cls, *args, **kwargs):
-        if six.PY2:
-            instance = super(BaseModel, cls).__new__(cls, *args, **kwargs)
-        else:
-            instance = super(BaseModel, cls).__new__(cls)
+        instance = super(BaseModel, cls).__new__(cls)
         cls.instances.append(instance)
         return instance
 
